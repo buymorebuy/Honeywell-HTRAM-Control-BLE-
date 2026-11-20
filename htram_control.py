@@ -66,8 +66,8 @@ class App:
         ttk.Label(root, textvariable=self.screen_var).pack(pady=(8, 0))
         f_screen = ttk.Frame(root)
         f_screen.pack(fill="x", padx=20, pady=4)
-        self.btn_screen_on = ttk.Button(f_screen, text="Always ON", state="disabled", command=lambda: self.set_screen_auto_off(False))
-        self.btn_screen_off = ttk.Button(f_screen, text="Auto-OFF (1 min)", state="disabled", command=lambda: self.set_screen_auto_off(True))
+        self.btn_screen_on = ttk.Button(f_screen, text="Screen ON", state="disabled", command=lambda: self.set_screen_off(False))
+        self.btn_screen_off = ttk.Button(f_screen, text="Screen OFF", state="disabled", command=lambda: self.set_screen_off(True))
         self.btn_screen_on.pack(side="left", expand=True, fill="x", padx=(0, 4))
         self.btn_screen_off.pack(side="left", expand=True, fill="x", padx=(4, 0))
 
@@ -84,8 +84,14 @@ class App:
             self.root.after(0, lambda: self.sound_var.set(f"Sound: {state}"))
         elif len(data) >= 13 and data[4:6] == b"\x41\x43":
             _, _, screen_off = struct.unpack(">HHH", data[7:13])
-            state = "Always ON" if screen_off == 0 else f"Auto-OFF ({screen_off} min)"
+            state = "ON" if screen_off == 0 else "OFF"
             self.root.after(0, lambda: self.screen_var.set(f"Screen: {state}"))
+
+    def on_ble_disconnect(self, _):
+        if self.heartbeat_task:
+            self.heartbeat_task.cancel()
+        self.client = None
+        self.root.after(0, self._on_disconnected_ui)
 
     def toggle_connect(self):
         if self.client and self.client.is_connected:
@@ -96,30 +102,44 @@ class App:
             asyncio.run_coroutine_threadsafe(self._connect(), self.loop)
 
     async def _connect(self):
-        try:
-            device = await BleakScanner.find_device_by_filter(
-                lambda d, _: bool(d.name and d.name.startswith("HTRAM")),
-                timeout=10.0,
-            )
-            if not device:
-                self.root.after(0, lambda: self._on_error_ui("Device not found (wake it up)"))
+        device = await BleakScanner.find_device_by_filter(
+            lambda d, _: bool(d.name and d.name.startswith("HTRAM")),
+            timeout=10.0,
+        )
+        if not device:
+            self.root.after(0, lambda: self._on_error_ui("Not found (wake device with button)"))
+            return
+
+        for attempt in range(1, 4):
+            client = None
+            try:
+                self.root.after(0, lambda a=attempt: self.status_var.set(f"Connecting ({a}/3)..."))
+                client = BleakClient(device, timeout=15.0, disconnected_callback=self.on_ble_disconnect)
+                await client.connect()
+                await asyncio.sleep(0.6)
+                if not client.is_connected:
+                    raise RuntimeError("Dropped after connect")
+
+                await client.start_notify(NOTIFY_CHAR_UUID, self.on_notify)
+                await client.write_gatt_char(WRITE_CHAR_UUID, build_packet(b"\x74\x58", b"\x01\x01\x00"))
+                await asyncio.sleep(0.4)
+                await client.write_gatt_char(WRITE_CHAR_UUID, build_packet(b"\x26\x23", b"\x01\x00"))
+                await asyncio.sleep(0.3)
+                await client.write_gatt_char(WRITE_CHAR_UUID, build_packet(b"\x40\x43", b"\x04\x00\x60\x06"))
+
+                self.client = client
+                self.heartbeat_task = asyncio.create_task(self._heartbeat())
+                self.root.after(0, lambda n=device.name: self._on_connected_ui(n))
                 return
+            except Exception:
+                if client:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                await asyncio.sleep(1.0)
 
-            self.root.after(0, lambda: self.status_var.set(f"Connecting to {device.name}..."))
-            client = BleakClient(device, timeout=15.0)
-            await client.connect()
-            await client.start_notify(NOTIFY_CHAR_UUID, self.on_notify)
-            await client.write_gatt_char(WRITE_CHAR_UUID, build_packet(b"\x74\x58", b"\x01\x01\x00"))
-            await asyncio.sleep(0.4)
-            await client.write_gatt_char(WRITE_CHAR_UUID, build_packet(b"\x26\x23", b"\x01\x00"))
-            await asyncio.sleep(0.3)
-            await client.write_gatt_char(WRITE_CHAR_UUID, build_packet(b"\x40\x43", b"\x04\x00\x60\x06"))
-
-            self.client = client
-            self.heartbeat_task = asyncio.create_task(self._heartbeat())
-            self.root.after(0, lambda: self._on_connected_ui(device.name))
-        except Exception:
-            self.root.after(0, lambda: self._on_error_ui("Error (pair in OS & wake device)"))
+        self.root.after(0, lambda: self._on_error_ui("Connection failed (pair in OS & wake)"))
 
     async def _heartbeat(self):
         try:
@@ -171,15 +191,15 @@ class App:
         await asyncio.sleep(0.3)
         await self.client.write_gatt_char(WRITE_CHAR_UUID, build_packet(b"\x26\x23", b"\x01\x00"))
 
-    def set_screen_auto_off(self, auto_off: bool):
-        asyncio.run_coroutine_threadsafe(self._send_screen(auto_off), self.loop)
+    def set_screen_off(self, off: bool):
+        asyncio.run_coroutine_threadsafe(self._send_screen(off), self.loop)
 
-    async def _send_screen(self, auto_off: bool):
+    async def _send_screen(self, off: bool):
         if not self.client or not self.client.is_connected:
             return
         await self.client.write_gatt_char(
             WRITE_CHAR_UUID,
-            build_packet(b"\x42\x43", b"\x04\x00\x20\x00" + struct.pack(">H", 1 if auto_off else 0)),
+            build_packet(b"\x42\x43", b"\x04\x00\x20\x00" + struct.pack(">H", 1 if off else 0)),
         )
         await asyncio.sleep(0.3)
         await self.client.write_gatt_char(WRITE_CHAR_UUID, build_packet(b"\x40\x43", b"\x04\x00\x60\x06"))
